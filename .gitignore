@@ -1,0 +1,16 @@
+# Large raw/training data (not for GitHub)
+/data/
+
+# Large data archives elsewhere in the project
+/test(@prediction task)/*.tar.gz
+/baseline/**/*.tar.gz
+
+# Nested project virtualenvs / build caches (each subproject has its own .gitignore too)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local editor / tool config (machine-specific, not project config)
+/.vscode/
+/.claude/

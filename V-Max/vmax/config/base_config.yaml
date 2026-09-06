@@ -1,0 +1,96 @@
+hydra:
+  run:
+    dir: ${output_dir:${algorithm.name}, ${observation_type}, ${network.encoder}, ${name_run}, ${name_exp}}
+
+defaults:
+  - _self_
+  - algorithm: ???
+  - network: base
+  - override hydra/job_logging: custom
+
+# Flags config
+debug_flag: false
+perf_flag: false
+cache_flag: false
+
+# Run config
+total_timesteps: 20_000_000
+num_envs: 16
+num_episode_per_epoch: 4
+num_scenario_per_eval: 256
+scenario_length: 80
+log_freq: 5
+save_freq: 200
+eval_freq: 0
+seed: 1  # keep nonzero: seed 0 silently disables the waymax file shuffle (falsy check)
+name_run: null
+name_exp: null
+
+# Env config
+path_dataset: null  # required unless mixture_datasets is set instead
+path_dataset_eval: null
+# If set, overrides path_dataset with a weighted mixture of several full pools
+# (e.g. scripts/split_hard_easy_pools.py's per-site hard/easy dirs) - nothing
+# is dropped from any pool, only how often each is drawn from is controlled.
+# Example CLI override:
+#   'mixture_datasets=[{path: /path/to/hanam_hard/....tfrecord@N, weight: 0.3}, {path: ..., weight: 0.2}]'
+mixture_datasets: null
+waymo_dataset: false
+max_num_objects: 64
+max_num_rg_points: 10000  # must match scripts/make_91f.py's ROADGRAPH_KEEP_POINTS for the dataset being loaded
+# termination_keys: [offroad, overlap, run_red_light]
+# termination_keys: [offroad, overlap]
+termination_keys: [offroad_in_box, overlap]
+
+# Reward config
+reward_type: linear
+reward_config:
+  overlap: -1.0
+  # offroad: -1.0
+  offroad_in_box: -1.0  # direction-free offroad (rideflux); pair with termination_keys
+  # red_light: -1.0
+  # off_route: -0.2
+  # sdc_progression: 0.2
+  expert_progression: 10.0
+  # comfort: 0.2
+  # overspeed: -0.1
+
+# Observation config
+observation_type: vec
+observation_config:
+  obs_past_num_steps: 5
+  objects:
+    features:
+      - waypoints
+      - velocity
+      - yaw
+      - size
+      - valid
+    num_closest_objects: 8
+  roadgraphs:
+    features:
+      - waypoints
+      - direction
+      # - types
+      - valid
+    element_types: [15, 16]
+    interval: 2
+    max_meters: 70
+    roadgraph_top_k: 200
+    meters_box:
+      front: 70
+      back: 5
+      left: 20
+      right: 20
+    max_num_lanes: 10
+    max_num_points_per_lane: 20
+  traffic_lights:
+    features:
+      - waypoints
+      - state
+      - valid
+    num_closest_traffic_lights: 5
+  path_target:
+    features:
+      - waypoints
+    num_points: 1

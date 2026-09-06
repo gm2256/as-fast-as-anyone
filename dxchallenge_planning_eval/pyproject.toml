@@ -1,0 +1,26 @@
+[project]
+name = "dxchallenge-planning-eval"
+version = "0.1.0"
+description = "DX challenge motion-planning evaluator: scores WaymaxActorCore submissions with the rideflux score"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops==0.8.2",
+    "flax==0.12.8",
+    "jax[cuda13]==0.11.0",
+    "numpy==2.5.1",
+    "tensorflow-cpu==2.21.0",
+    "waymo-waymax",
+]
+
+[tool.uv]
+# Prevent installing the GPU/monolithic TensorFlow package pulled by waymo-waymax.
+exclude-dependencies = ["tensorflow"]
+
+[tool.uv.sources]
+# waymo-waymax = { git = "https://github.com/waymo-research/waymax.git", rev = "main" }
+waymo-waymax = { git = "https://github.com/waymo-research/waymax.git", rev = "a64dfec9be8576b60d9cecc94f406d9812d4a7d0" }
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
