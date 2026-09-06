@@ -40,6 +40,9 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--hard-frac", type=float, default=0.4, help="top fraction (by combined_score, per site) kept as 'hard'")
     args = ap.parse_args()
+    # A relative root_91f would be baked into each symlink target as-is, resolving
+    # relative to the symlink's own directory (out_dir) instead of the caller's cwd.
+    args.root_91f = os.path.abspath(args.root_91f)
 
     by_site = defaultdict(list)
     with open(args.scores_csv, newline="") as fh:

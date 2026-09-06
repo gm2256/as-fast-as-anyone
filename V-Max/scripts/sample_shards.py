@@ -58,6 +58,9 @@ def main():
     ap.add_argument("--hard-frac", type=float, default=0.6, help="fraction of --n taken from the hard-ranked set")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    # A relative root_91f would be baked into each symlink target as-is, resolving
+    # relative to the symlink's own directory (out_dir) instead of the caller's cwd.
+    args.root_91f = os.path.abspath(args.root_91f)
 
     rows = load_scores(args.scores_csv)
     print(f"loaded {len(rows)} scored files from {args.scores_csv}")
