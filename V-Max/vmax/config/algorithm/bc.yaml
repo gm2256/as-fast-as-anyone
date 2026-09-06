@@ -9,6 +9,8 @@ batch_size: 64
 grad_updates_per_step: 8
 loss_type: mse  # options: 'mae', 'mse'
 buffer_size: 1_000_000
+pretrained_params_path: null
+resume: true
 
 network:
   policy:

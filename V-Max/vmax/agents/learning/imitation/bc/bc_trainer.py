@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import typing
 from collections.abc import Callable
 from functools import partial
@@ -48,6 +49,8 @@ def train(
     progress_fn: Callable[[int, datatypes.Metrics], None] = lambda *args: None,
     checkpoint_logdir: str = "",
     disable_tqdm: bool = False,
+    pretrained_params_path: str | None = None,
+    resume: bool = True,
 ) -> None:
     """Train a Behavioral Cloning (BC) model.
 
@@ -75,6 +78,18 @@ def train(
         progress_fn: Callback function for reporting progress.
         checkpoint_logdir: Directory path for storing checkpoints.
         disable_tqdm: Flag to disable tqdm progress bar.
+        pretrained_params_path: Path to a params-only checkpoint (as written by
+            `save_params`) used to warm-start network weights only; optimizer
+            state and step counters start fresh. Ignored if a full checkpoint
+            is resumed (see `resume`).
+        resume: If True (default) and `checkpoint_logdir/train_state_latest.pkl`
+            exists, restore the *full* training state (params, optimizer state,
+            il_gradient_steps, env_steps) from it and continue this same run
+            from where it left off - `total_timesteps` is treated as an
+            absolute target, so remaining steps = total_timesteps - env_steps
+            already done. This is what makes it safe to kill and re-launch the
+            same `name_run` (e.g. after a reboot) without losing progress. Set
+            False to force a fresh run even if a checkpoint is present.
 
     """
     print(" BC ".center(40, "="))
@@ -87,7 +102,6 @@ def train(
 
     num_steps = num_episode_per_epoch * scenario_length
     env_steps_per_iter = num_steps * num_envs
-    total_iters = (total_timesteps // env_steps_per_iter) + 1
 
     observation_size = env.observation_spec()
     action_size = env.action_spec().data.shape[0]
@@ -104,6 +118,22 @@ def train(
         num_devices,
         network_key,
     )
+
+    resume_path = f"{checkpoint_logdir}/train_state_latest.pkl" if checkpoint_logdir else None
+    resumed_step = 0
+    if resume and resume_path and os.path.exists(resume_path):
+        print(f"-> Resuming full training state from {resume_path} ...")
+        loaded_state = train_utils.load_params(resume_path)
+        training_state = pmap.device_put_replicated(loaded_state, jax.local_devices()[:num_devices])
+        resumed_step = int(pmap.unpmap(training_state.env_steps))
+        print(f"-> Resuming full training state... Done (env_steps={resumed_step}).")
+    elif pretrained_params_path:
+        print(f"-> Loading pretrained params from {pretrained_params_path} ...")
+        loaded_params = train_utils.load_params(pretrained_params_path)
+        loaded_params = pmap.device_put_replicated(loaded_params, jax.local_devices()[:num_devices])
+        training_state = training_state.replace(params=loaded_params)
+        print("-> Loading pretrained params... Done.")
+
     learning_fn = bc.make_sgd_step(network, loss_type)
     step_fn = partial(inference.expert_step, use_partial_transition=True)
 
@@ -154,7 +184,11 @@ def train(
 
     time_training = perf_counter()
 
-    current_step = 0
+    current_step = resumed_step
+    remaining_timesteps = max(0, total_timesteps - resumed_step)
+    total_iters = (remaining_timesteps // env_steps_per_iter) + (1 if remaining_timesteps > 0 else 0)
+    if resumed_step:
+        print(f"-> {resumed_step}/{total_timesteps} steps already done, {total_iters} iterations remaining")
 
     print("-> Ground Control to Major Tom...")
     for iter in tqdm(
@@ -200,6 +234,7 @@ def train(
         if do_save and not iter % save_freq:
             path = f"{checkpoint_logdir}/model_{current_step}.pkl"
             train_utils.save_params(path, pmap.unpmap(training_state.params))
+            train_utils.save_params(f"{checkpoint_logdir}/train_state_latest.pkl", pmap.unpmap(training_state))
 
         epoch_log_time = perf_counter() - t
 
@@ -239,6 +274,7 @@ def train(
     if checkpoint_logdir:
         path = f"{checkpoint_logdir}/model_final.pkl"
         train_utils.save_params(path, pmap.unpmap(training_state.params))
+        train_utils.save_params(f"{checkpoint_logdir}/train_state_latest.pkl", pmap.unpmap(training_state))
 
     pmap.assert_is_replicated(training_state)
     pmap.synchronize_hosts()
