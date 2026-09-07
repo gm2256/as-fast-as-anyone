@@ -12,11 +12,22 @@ files, average into combined_score, then split at --hard-frac (top X% by
 combined_score -> hard, rest -> easy). Per-site (not global) so the jeju/hanam
 mix ratio and the hard/easy mix ratio stay independently controllable.
 
+--drop-frac additionally DISCARDS the bottom X% of each site outright (the
+"직진 위주 단순 데이터 제거" step of report/contest_pipeline.md): those files are
+near-static lane keeping, and unlike reweighting a pool, dropping them shrinks
+the epoch so the remaining budget goes to scenarios worth imitating. Ranks are
+computed over all of a site's files first, then the bottom --drop-frac is
+removed and --hard-frac applies to what is left.
+
+--sites restricts which sites get pools at all (e.g. skip livinglab, which the
+contest does not evaluate).
+
 Output: <out_dir>/<site>_hard/ and <out_dir>/<site>_easy/, each a full
 symlink shard set (same layout as make_waymax_shards.py) with a manifest.csv.
 
 Usage:
-  uv run python scripts/split_hard_easy_pools.py <scores_csv> <root_91f> <out_dir> --hard-frac 0.4
+  uv run python scripts/split_hard_easy_pools.py <scores_csv> <root_91f> <out_dir> \
+      --sites hanam,jeju --drop-frac 0.2 --hard-frac 0.4
 """
 
 import argparse
@@ -38,8 +49,11 @@ def main():
     ap.add_argument("scores_csv")
     ap.add_argument("root_91f")
     ap.add_argument("out_dir")
-    ap.add_argument("--hard-frac", type=float, default=0.4, help="top fraction (by combined_score, per site) kept as 'hard'")
+    ap.add_argument("--hard-frac", type=float, default=0.4, help="top fraction (by combined_score, of the kept files, per site) kept as 'hard'")
+    ap.add_argument("--drop-frac", type=float, default=0.0, help="bottom fraction (by combined_score, per site) discarded entirely")
+    ap.add_argument("--sites", default=None, help="comma-separated sites to build pools for (default: every site in the CSV)")
     args = ap.parse_args()
+    keep_sites = set(args.sites.split(",")) if args.sites else None
     # A relative root_91f would be baked into each symlink target as-is, resolving
     # relative to the symlink's own directory (out_dir) instead of the caller's cwd.
     args.root_91f = os.path.abspath(args.root_91f)
@@ -48,6 +62,8 @@ def main():
     with open(args.scores_csv, newline="") as fh:
         for r in csv.DictReader(fh):
             if r["error"]:
+                continue
+            if keep_sites is not None and r["site"] not in keep_sites:
                 continue
             r["max_abs_yaw_rate"] = float(r["max_abs_yaw_rate"])
             r["max_abs_accel"] = float(r["max_abs_accel"])
@@ -63,11 +79,17 @@ def main():
             r["combined_score"] = (yaw_r[i] + acc_r[i] + den_r[i]) / 3.0
 
         rows_sorted = sorted(rows, key=lambda r: r["combined_score"], reverse=True)
-        n_hard = int(round(len(rows_sorted) * args.hard_frac))
-        hard_rows = rows_sorted[:n_hard]
-        easy_rows = rows_sorted[n_hard:]
+        n_drop = int(round(len(rows_sorted) * args.drop_frac))
+        dropped = rows_sorted[len(rows_sorted) - n_drop :] if n_drop else []
+        kept = rows_sorted[: len(rows_sorted) - n_drop] if n_drop else rows_sorted
+        n_hard = int(round(len(kept) * args.hard_frac))
+        hard_rows = kept[:n_hard]
+        easy_rows = kept[n_hard:]
 
-        print(f"{site}: {len(rows)} files total -> {len(hard_rows)} hard + {len(easy_rows)} easy")
+        drop_note = ""
+        if dropped:
+            drop_note = f", dropped {len(dropped)} (combined_score <= {dropped[0]['combined_score']:.3f})"
+        print(f"{site}: {len(rows)} files total -> {len(hard_rows)} hard + {len(easy_rows)} easy{drop_note}")
         write_pool(os.path.join(args.out_dir, f"{site}_hard"), args.root_91f, hard_rows)
         write_pool(os.path.join(args.out_dir, f"{site}_easy"), args.root_91f, easy_rows)
 
