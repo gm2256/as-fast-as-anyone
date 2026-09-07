@@ -24,13 +24,20 @@ Colab disconnects:
     the dataset (the standalone `score_scenarios.py` run is not needed).
 
 `livinglab` is excluded by default: the contest evaluates hanam/jeju only.
+Sites are processed round-robin, so a run cut short still covers all of them.
+
+Local disk, not Drive, is the binding constraint (a Colab instance has ~112GB
+while the full 3-window conversion is several times that), so two flags exist
+to fit it: `--windows 100` emits one 91-step window per source file instead of
+three (1/3 the bytes), and `--min-free-gb` stops the run cleanly - combined CSV
+written, nothing half-done left behind - instead of dying on ENOSPC.
 
 Usage:
   uv run python scripts/prepare_archives_91f.py <train_root> <out_root_91f> \
       --sites hanam,jeju \
       --cache-dir /content/drive/MyDrive/vmax_workdir/cache_91f \
       --scores-dir /content/drive/MyDrive/vmax_workdir/scores \
-      [--max-archives-per-site N] [--workers N]
+      [--windows 100] [--min-free-gb 15] [--max-archives-per-site N] [--workers N]
 """
 
 import argparse
@@ -43,6 +50,7 @@ import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
+from itertools import zip_longest
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
@@ -166,6 +174,27 @@ def save_to_cache(cache_dir: str, out_root: str, site: str, date: str) -> None:
     os.replace(tmp, tar_path)
 
 
+def free_gb(path: str) -> float:
+    return shutil.disk_usage(path).free / 2**30
+
+
+def clear_partial_outputs(out_date_dir: str) -> int:
+    """Delete `.tmp` leftovers from a run that died mid-write (e.g. ENOSPC).
+
+    convert_file writes `<out>.tmp` then renames, so a `.tmp` is always dead
+    weight: the real output is absent, and the next run rewrites it from
+    scratch. Left alone they keep occupying the disk that just filled up.
+    """
+    if not os.path.isdir(out_date_dir):
+        return 0
+    n = 0
+    for fn in os.listdir(out_date_dir):
+        if fn.endswith(".tmp"):
+            os.remove(os.path.join(out_date_dir, fn))
+            n += 1
+    return n
+
+
 def process_archive(args, site: str, archive_name: str) -> dict:
     date = archive_date(archive_name)
     scores_csv = os.path.join(args.scores_dir, site, f"{date}.csv")
@@ -180,32 +209,54 @@ def process_archive(args, site: str, archive_name: str) -> dict:
         print(f"[{site}/{date}] restored from cache in {time.time() - t0:.0f}s", flush=True)
         return {"restored": 1}
 
+    n_tmp = clear_partial_outputs(out_date_dir)
+    if n_tmp:
+        print(f"[{site}/{date}] cleaned {n_tmp} .tmp leftovers from a previous crash", flush=True)
+
     raw_dir = os.path.join(args.tmp_dir, site, date)
-    n_raw = extract_archive(os.path.join(args.train_root, site, archive_name), raw_dir)
-    if n_raw == 0:
-        print(f"[{site}/{date}] !! no .tfrecord inside archive - skip", flush=True)
+    try:
+        n_raw = extract_archive(os.path.join(args.train_root, site, archive_name), raw_dir)
+        if n_raw == 0:
+            print(f"[{site}/{date}] !! no .tfrecord inside archive - skip", flush=True)
+            return {"empty": 1}
+        t_extract = time.time() - t0
+
+        rels = [f"{site}/{date}/{fn}" for fn in sorted(os.listdir(raw_dir)) if fn.endswith(".tfrecord")]
+        # in_root must be the parent of <site>/<date> for the rels above to resolve
+        in_root = args.tmp_dir
+        os.environ["M91_NO_PATHS"] = "0" if detect_schema(os.path.join(in_root, rels[0])) else "1"
+
+        chunks = [rels[i : i + 25] for i in range(0, len(rels), 25)]
+        tot = {"ok": 0, "skip": 0, "fail": 0, "sdc_invalid_windows": 0}
+        rows = []
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            for r in ex.map(convert_and_score, [in_root] * len(chunks), [args.out_root] * len(chunks), chunks):
+                for k in tot:
+                    tot[k] += r[k]
+                rows.extend(r["rows"])
+                for rel, err in r["errors"]:
+                    print(f"  !! {rel}\n     {err}", flush=True)
+    finally:
+        # Always: a crashed run must not leave the raw copy behind on a disk
+        # that is, by hypothesis, already full.
         shutil.rmtree(raw_dir, ignore_errors=True)
-        return {"empty": 1}
-    t_extract = time.time() - t0
 
-    rels = [f"{site}/{date}/{fn}" for fn in sorted(os.listdir(raw_dir)) if fn.endswith(".tfrecord")]
-    # in_root must be the parent of <site>/<date> for the rels above to resolve
-    in_root = args.tmp_dir
-    os.environ["M91_NO_PATHS"] = "0" if detect_schema(os.path.join(in_root, rels[0])) else "1"
-
-    chunks = [rels[i : i + 25] for i in range(0, len(rels), 25)]
-    tot = {"ok": 0, "skip": 0, "fail": 0, "sdc_invalid_windows": 0}
-    rows = []
-    with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        for r in ex.map(convert_and_score, [in_root] * len(chunks), [args.out_root] * len(chunks), chunks):
-            for k in tot:
-                tot[k] += r[k]
-            rows.extend(r["rows"])
-            for rel, err in r["errors"]:
-                print(f"  !! {rel}\n     {err}", flush=True)
+    # The scores CSV is this archive's "done" marker, so only write it if the
+    # archive really converted. A disk that filled mid-archive fails most of
+    # its files at once; marking that done would silently drop the whole date
+    # from every later run (the failed rows carry `error` and are skipped by
+    # split_hard_easy_pools.py).
+    if tot["fail"] > 0.2 * n_raw:
+        print(
+            f"[{site}/{date}] !! {tot['fail']}/{n_raw} files failed - NOT marking done "
+            f"({free_gb(args.out_root):.1f}GB free; out of disk?). It will be retried on the next run.",
+            flush=True,
+        )
+        return {"failed": 1, "files": n_raw, **tot}
+    if tot["fail"]:
+        print(f"[{site}/{date}] !! {tot['fail']}/{n_raw} files failed (kept the rest)", flush=True)
 
     write_scores_csv(scores_csv, rows)
-    shutil.rmtree(raw_dir, ignore_errors=True)
     if args.cache_dir:
         save_to_cache(args.cache_dir, args.out_root, site, date)
 
@@ -250,7 +301,19 @@ def main():
     ap.add_argument("--tmp-dir", default=os.path.join(tempfile.gettempdir(), "prep91f_raw"), help="scratch dir for extracted raw archives")
     ap.add_argument("--max-archives-per-site", type=int, default=None, help="cap dates per site (debug / partial runs)")
     ap.add_argument("--workers", type=int, default=os.cpu_count(), help="conversion processes (default: all cores)")
+    ap.add_argument(
+        "--windows", default=None,
+        help="comma-separated subset of make_91f's 0,100,200 window starts (default: all 3). "
+             "'--windows 100' emits one 91-step window per source file -> 1/3 the output bytes",
+    )
+    ap.add_argument(
+        "--min-free-gb", type=float, default=15.0,
+        help="stop cleanly (still writing combined_scores.csv) before starting an archive that would "
+             "leave less than this much free local disk",
+    )
     args = ap.parse_args()
+    if args.windows:
+        os.environ["M91_WINDOW_STARTS"] = args.windows  # inherited by the worker processes
 
     sites = [s for s in args.sites.split(",") if s]
     for site in sites:
@@ -259,22 +322,44 @@ def main():
     os.makedirs(args.scores_dir, exist_ok=True)
     os.makedirs(args.tmp_dir, exist_ok=True)
 
-    plan = []
+    # Interleave the sites (hanam, jeju, hanam, ...) instead of finishing one
+    # before starting the next: a run cut short by disk/time/disconnect then
+    # still covers every site, and split_hard_easy_pools.py can build all of
+    # its per-site pools. Site-major order would leave the later site empty.
+    per_site = []
     for site in sites:
         names = list_archives(args.train_root, site)
         if args.max_archives_per_site:
             names = names[: args.max_archives_per_site]
-        plan += [(site, n) for n in names]
-    print(f"{len(plan)} archives over sites {sites}  ({args.workers} workers)\n", flush=True)
+        per_site.append([(site, n) for n in names])
+    plan = [item for row in zip_longest(*per_site) for item in row if item is not None]
+    print(
+        f"{len(plan)} archives over sites {sites}  ({args.workers} workers, "
+        f"windows {os.environ.get('M91_WINDOW_STARTS', '0,100,200')}, "
+        f"{free_gb(args.out_root):.0f}GB free)\n",
+        flush=True,
+    )
 
     t0 = time.time()
-    tot = {"converted": 0, "restored": 0, "skipped": 0, "empty": 0, "files": 0, "ok": 0, "fail": 0}
+    tot = {"converted": 0, "restored": 0, "skipped": 0, "empty": 0, "failed": 0, "files": 0, "ok": 0, "fail": 0}
     for i, (site, name) in enumerate(plan, 1):
+        if free_gb(args.out_root) < args.min_free_gb:
+            print(
+                f"\n!! STOPPING at {i}/{len(plan)}: only {free_gb(args.out_root):.1f}GB free "
+                f"(< --min-free-gb {args.min_free_gb}). Everything converted so far is kept; "
+                f"build pools from combined_scores.csv, or re-run with '--windows 100' for 1/3 the output.",
+                flush=True,
+            )
+            break
         r = process_archive(args, site, name)
         for k in tot:
             tot[k] += r.get(k, 0)
         el = time.time() - t0
-        print(f"  --- {i}/{len(plan)} archives  {el / 60:.1f}min  eta {el / i * (len(plan) - i) / 60:.1f}min  {tot}", flush=True)
+        print(
+            f"  --- {i}/{len(plan)} archives  {el / 60:.1f}min  eta {el / i * (len(plan) - i) / 60:.1f}min  "
+            f"{free_gb(args.out_root):.0f}GB free  {tot}",
+            flush=True,
+        )
 
     write_combined_csv(args.scores_dir, sites)
     print(f"DONE {(time.time() - t0) / 60:.1f}min  {tot}", flush=True)

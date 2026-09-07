@@ -168,6 +168,24 @@ def _tf():
     return _TF, _DESC
 
 
+def window_starts() -> tuple[int, ...]:
+    """Which of WINDOW_STARTS to actually emit, per the M91_WINDOW_STARTS env var.
+
+    Set by the `--windows` flag of this script / prepare_archives_91f.py and
+    read inside the worker processes. Emitting fewer windows shrinks the output
+    proportionally (3 windows per source file is 3x the bytes), which is what
+    makes the dataset fit a fixed-size disk; the windows are non-overlapping
+    slices of the same scene, so dropping two of three costs scene diversity
+    only within a file, not across the dataset.
+    """
+    env = os.environ.get("M91_WINDOW_STARTS")
+    if not env:
+        return WINDOW_STARTS
+    starts = tuple(int(x) for x in env.split(","))
+    assert all(s in WINDOW_STARTS for s in starts), f"{starts} not a subset of {WINDOW_STARTS}"
+    return starts
+
+
 def cat_state(p, name):
     return np.concatenate(
         [p[f"state/past/{name}"], p[f"state/current/{name}"], p[f"state/future/{name}"]],
@@ -235,7 +253,8 @@ def convert_file(in_root: str, out_root: str, rel: str) -> dict:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp = out_path + ".tmp"
     with tf.io.TFRecordWriter(tmp) as w:
-        for wi, s in enumerate(WINDOW_STARTS):
+        for s in window_starts():
+            wi = WINDOW_STARTS.index(s)
             if not sdc_valid[s + N_PAST_OUT]:
                 stats["sdc_invalid_windows"] += 1
 
@@ -312,7 +331,14 @@ def main():
         "smoke_n", nargs="?", type=int, default=None,
         help="optional: convert only N files spread over the dataset",
     )
+    ap.add_argument(
+        "--windows", default=None,
+        help="comma-separated subset of the 0,100,200 window starts to emit (default: all 3). "
+             "'--windows 100' emits one window per source file -> 1/3 the output bytes",
+    )
     args = ap.parse_args()
+    if args.windows:
+        os.environ["M91_WINDOW_STARTS"] = args.windows
 
     rels = []
     for site in sorted(os.listdir(args.in_root)):
