@@ -56,6 +56,7 @@ def train(
     val_freq: int = 0,
     early_stop_patience: int = 0,
     early_stop_min_delta: float = 0.0,
+    early_stop_warmup_steps: int = 0,
 ) -> None:
     """Train a Behavioral Cloning (BC) model.
 
@@ -100,6 +101,13 @@ def train(
         early_stop_min_delta: How much lower than the best validation loss a
             new one must be to count as an improvement (absolute, same units as
             the loss). Guards against stopping on pure noise.
+        early_stop_warmup_steps: Env steps during which the validation loss is
+            logged but neither tracked as "best" nor counted toward patience.
+            A tanh-output policy starts near zero and so do most expert actions,
+            so the loss is already low at init and normally rises before it
+            falls; without a warmup the run stops in that transient and keeps an
+            untrained network as its best. The baseline is taken fresh at the
+            first validation after the warmup.
         resume: If True (default) and `checkpoint_logdir/train_state_latest.pkl`
             exists, restore the *full* training state (params, optimizer state,
             il_gradient_steps, env_steps) from it and continue this same run
@@ -295,7 +303,10 @@ def train(
 
         metrics = {
             "runtime/sps": int(env_steps_per_iter / epoch_training_time),
-            **{f"{name}": value for name, value in training_metrics.items() if "learning" in name},
+            # _reshape_metrics prefixes the sgd metrics with "train/" (this used
+            # to filter on "learning", which matches nothing - so the imitation
+            # loss, the one curve that says whether BC works, was never logged).
+            **{name: value for name, value in training_metrics.items() if name.startswith("train/")},
         }
 
         if do_save and not iter % save_freq:
@@ -320,8 +331,12 @@ def train(
         if do_validation and not iter % val_freq:
             t = perf_counter()
             val_loss = float(jnp.mean(run_validation(val_scenario, training_state, val_keys)))
-            improved = val_loss < best_val_loss - early_stop_min_delta
-            if improved:
+
+            in_warmup = current_step < early_stop_warmup_steps
+            improved = (not in_warmup) and val_loss < best_val_loss - early_stop_min_delta
+            if in_warmup:
+                pass  # logged below; no best, no patience - see early_stop_warmup_steps
+            elif improved:
                 best_val_loss, best_val_step, n_stale_vals = val_loss, current_step, 0
                 if checkpoint_logdir:
                     train_utils.save_params(
@@ -330,7 +345,7 @@ def train(
             else:
                 n_stale_vals += 1
 
-            if val_state_path:
+            if val_state_path and not in_warmup:
                 with open(val_state_path, "w") as fh:
                     json.dump(
                         {
@@ -345,22 +360,22 @@ def train(
 
             # No total_timesteps here: that branch of log_metrics prints the
             # per-iteration runtime keys, which this dict does not carry.
-            progress_fn(
-                current_step,
-                {
-                    "val/imitation_loss": val_loss,
-                    "val/best_imitation_loss": best_val_loss,
-                    "val/stale_validations": n_stale_vals,
-                    "val/val_time": perf_counter() - t,
-                },
-            )
+            val_metrics = {"val/imitation_loss": val_loss, "val/val_time": perf_counter() - t}
+            if not in_warmup:  # best is still +inf during warmup - not a plottable value
+                val_metrics["val/best_imitation_loss"] = best_val_loss
+                val_metrics["val/stale_validations"] = n_stale_vals
+            progress_fn(current_step, val_metrics)
             print(
-                f"-> val/imitation_loss {val_loss:.6f} (best {best_val_loss:.6f} @ step "
-                f"{best_val_step}, {n_stale_vals} stale)",
+                f"-> val/imitation_loss {val_loss:.6f} "
+                + (
+                    f"(warmup, no early stop before {early_stop_warmup_steps} steps)"
+                    if in_warmup
+                    else f"(best {best_val_loss:.6f} @ step {best_val_step}, {n_stale_vals} stale)"
+                ),
                 flush=True,
             )
 
-            if early_stop_patience and n_stale_vals >= early_stop_patience:
+            if not in_warmup and early_stop_patience and n_stale_vals >= early_stop_patience:
                 print(
                     f"-> EARLY STOP at step {current_step}: no improvement > {early_stop_min_delta} "
                     f"over {best_val_loss:.6f} in {n_stale_vals} validations. "

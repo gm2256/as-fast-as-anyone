@@ -18,8 +18,13 @@ resume: true
 # One validation replays num_scenario_per_val scenarios with the expert, so it
 # costs a few training iterations - every 100 keeps the overhead at a few percent.
 val_freq: 100           # validate every N iterations (0 disables validation)
-early_stop_patience: 5  # stop after N consecutive validations with no improvement (0 = log only)
+early_stop_patience: 10  # stop after N consecutive validations with no improvement (0 = log only)
 early_stop_min_delta: 0.0  # improvement smaller than this does not reset the patience counter
+# A tanh-output policy starts near zero and so do most expert actions, so the
+# validation loss is already low at init and typically rises before it falls.
+# Stopping is disabled until this many env steps to keep that transient from
+# ending the run at an untrained network.
+early_stop_warmup_steps: 1_000_000
 
 network:
   policy:
