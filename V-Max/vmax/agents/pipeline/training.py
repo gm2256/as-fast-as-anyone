@@ -246,6 +246,12 @@ def run_validation_loss(
 
         # policy_fn is unused by expert_step; the expert drives, we only score.
         next_state, _, data = unroll_fn(env_state, None, unroll_key)
+
+        # (unroll_length, num_envs, ...) -> (num_envs * unroll_length, ...), the
+        # flat batch of transitions the loss expects. run_training_off_policy
+        # does this before the replay buffer; without it the network gets an
+        # extra leading axis and the encoder fails on the rank.
+        data = jax.tree.map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data)
         loss = loss_fn(training_state.params.policy, data)
 
         return (next_state, _key), loss
