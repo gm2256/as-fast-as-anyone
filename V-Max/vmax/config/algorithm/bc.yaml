@@ -33,6 +33,11 @@ early_stop_smoothing: 0.7
 network:
   policy:
     type: mlp
+    # If this BC run is meant to warm-start SAC, match sac.yaml's policy
+    # layer_sizes (and network/encoder): only arrays whose shape matches
+    # transfer, so a different hidden stack means SAC's hidden layers all
+    # start from scratch. The head cannot transfer either way - BC emits the
+    # action, SAC emits the parameters of a distribution over it.
     layer_sizes: [256, 64, 32]
     activation: relu  # gelu, relu, selu
     final_activation: tanh
