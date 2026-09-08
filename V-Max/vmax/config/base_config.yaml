@@ -29,6 +29,11 @@ name_exp: null
 # Env config
 path_dataset: null  # required unless mixture_datasets is set instead
 path_dataset_eval: null
+# Held-out scenarios for the BC validation loss / early stopping. Must not
+# overlap the training pools - scripts/split_hard_easy_pools.py --holdout-frac
+# carves one out and excludes it from the pools it writes.
+path_dataset_val: null
+num_scenario_per_val: 64
 # If set, overrides path_dataset with a weighted mixture of several full pools
 # (e.g. scripts/split_hard_easy_pools.py's per-site hard/easy dirs) - nothing
 # is dropped from any pool, only how often each is drawn from is controlled.

@@ -17,6 +17,7 @@ from .training import (
     run_evaluation,
     run_training_off_policy,
     run_training_on_policy,
+    run_validation_loss,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "run_evaluation",
     "run_training_off_policy",
     "run_training_on_policy",
+    "run_validation_loss",
 ]

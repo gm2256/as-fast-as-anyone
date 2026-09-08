@@ -12,6 +12,15 @@ buffer_size: 1_000_000
 pretrained_params_path: null
 resume: true
 
+# Early stopping on a held-out validation loss (needs path_dataset_val).
+# BC's useful phase is the initial steep drop; past the plateau the policy
+# fits expert noise instead of learning to drive.
+# One validation replays num_scenario_per_val scenarios with the expert, so it
+# costs a few training iterations - every 100 keeps the overhead at a few percent.
+val_freq: 100           # validate every N iterations (0 disables validation)
+early_stop_patience: 5  # stop after N consecutive validations with no improvement (0 = log only)
+early_stop_min_delta: 0.0  # improvement smaller than this does not reset the patience counter
+
 network:
   policy:
     type: mlp

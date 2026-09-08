@@ -150,7 +150,7 @@ def make_sgd_step(bc_network: BCNetwork, loss_type: str) -> datatypes.LearningFu
         A function that executes an SGD step.
 
     """
-    policy_loss = _make_loss_fn(bc_network, loss_type)
+    policy_loss = make_loss_fn(bc_network, loss_type)
     policy_update = networks.gradient_update_fn(
         policy_loss, bc_network.optimizer, pmap_axis_name="batch"
     )
@@ -182,8 +182,8 @@ def make_sgd_step(bc_network: BCNetwork, loss_type: str) -> datatypes.LearningFu
     return sgd_step
 
 
-def _make_loss_fn(bc_network: BCNetwork, loss_type: str):
-    """Generate the loss function for BC training.
+def make_loss_fn(bc_network: BCNetwork, loss_type: str):
+    """Generate the loss function for BC training (also used for validation).
 
     Args:
         bc_network: Instance of BCNetwork.

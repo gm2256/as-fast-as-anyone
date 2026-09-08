@@ -329,8 +329,15 @@ def main():
     per_site = []
     for site in sites:
         names = list_archives(args.train_root, site)
-        if args.max_archives_per_site:
-            names = names[: args.max_archives_per_site]
+        n_keep = args.max_archives_per_site
+        if n_keep and n_keep < len(names):
+            # Spread the subset over the whole date range rather than taking the
+            # first N: archives are named by date, so the first N would be one
+            # contiguous stretch of weeks - one season, one set of construction
+            # zones, one weather pattern - which is exactly the kind of
+            # correlated sample a policy overfits to.
+            step = len(names) / n_keep
+            names = [names[int(i * step)] for i in range(n_keep)]
         per_site.append([(site, n) for n in names])
     plan = [item for row in zip_longest(*per_site) for item in row if item is not None]
     print(

@@ -129,12 +129,15 @@ def build_config_dicts(config: dict) -> tuple[dict, dict]:
     """
     path_dataset = datasets.get_dataset(config["path_dataset"])
     path_dataset_eval = datasets.get_dataset(config["path_dataset_eval"])
+    path_dataset_val = datasets.get_dataset(config["path_dataset_val"])
 
     sdc_paths_from_data = not config["waymo_dataset"]
 
     env_config = {
         "path_dataset": path_dataset,
         "path_dataset_eval": path_dataset_eval,
+        "path_dataset_val": path_dataset_val,
+        "num_scenario_per_val": config["num_scenario_per_val"],
         "sdc_paths_from_data": sdc_paths_from_data,
         "termination_keys": config["termination_keys"],
         "max_num_objects": config["max_num_objects"],

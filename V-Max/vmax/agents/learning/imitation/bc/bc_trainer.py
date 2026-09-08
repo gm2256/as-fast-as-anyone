@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import typing
 from collections.abc import Callable
@@ -51,6 +52,10 @@ def train(
     disable_tqdm: bool = False,
     pretrained_params_path: str | None = None,
     resume: bool = True,
+    val_scenario: waymax_datatypes.SimulatorState | None = None,
+    val_freq: int = 0,
+    early_stop_patience: int = 0,
+    early_stop_min_delta: float = 0.0,
 ) -> None:
     """Train a Behavioral Cloning (BC) model.
 
@@ -82,6 +87,19 @@ def train(
             `save_params`) used to warm-start network weights only; optimizer
             state and step counters start fresh. Ignored if a full checkpoint
             is resumed (see `resume`).
+        val_scenario: Held-out scenarios for the validation loss (built by
+            train.py from `path_dataset_val`). None disables validation.
+        val_freq: Compute the validation loss every N iterations (0 disables).
+        early_stop_patience: Stop training after this many consecutive
+            validations without a `early_stop_min_delta` improvement over the
+            best loss so far (0 disables early stopping, so validation is only
+            logged). BC's useful phase is the initial steep drop; past the
+            point where the validation loss flattens the policy keeps fitting
+            expert noise, loses its ability to recover from its own mistakes,
+            and gives RL fine-tuning a worse starting point.
+        early_stop_min_delta: How much lower than the best validation loss a
+            new one must be to count as an improvement (absolute, same units as
+            the loss). Guards against stopping on pure noise.
         resume: If True (default) and `checkpoint_logdir/train_state_latest.pkl`
             exists, restore the *full* training state (params, optimizer state,
             il_gradient_steps, env_steps) from it and continue this same run
@@ -99,6 +117,7 @@ def train(
 
     do_save = save_freq > 1 and checkpoint_logdir is not None
     do_evaluation = eval_freq >= 1
+    do_validation = val_scenario is not None and val_freq >= 1
 
     num_steps = num_episode_per_epoch * scenario_length
     env_steps_per_iter = num_steps * num_envs
@@ -118,6 +137,17 @@ def train(
         num_devices,
         network_key,
     )
+
+    # A run that early-stopped is finished, even though env_steps never reached
+    # total_timesteps. Without this, re-launching the same name_run (the normal
+    # way to recover from a disconnect) would resume and train straight past
+    # the point validation told us to stop at.
+    early_stop_marker = f"{checkpoint_logdir}/early_stopped.txt" if checkpoint_logdir else None
+    if resume and early_stop_marker and os.path.exists(early_stop_marker):
+        with open(early_stop_marker) as fh:
+            print(f"-> This run already stopped early:\n{fh.read().strip()}")
+        print("-> Nothing to do. Delete that file (or set algorithm.resume=false) to train further.")
+        return
 
     resume_path = f"{checkpoint_logdir}/train_state_latest.pkl" if checkpoint_logdir else None
     resumed_step = 0
@@ -179,6 +209,23 @@ def train(
     run_training = jax.pmap(run_training, axis_name="batch")
     run_evaluation = jax.pmap(run_evaluation, axis_name="batch")
 
+    if do_validation:
+        # Same unroll, same loss, same batch shape as training - only the
+        # scenarios differ (held out) and no gradient is taken. val_scenario's
+        # per-device shape is (num_envs, num_val_episode), so one unroll covers
+        # num_envs episodes and scan_length walks all of them.
+        num_val_episode = val_scenario.shape[-1]
+        run_validation = jax.pmap(
+            partial(
+                pipeline.run_validation_loss,
+                env=env,
+                loss_fn=bc.make_loss_fn(network, loss_type),
+                unroll_fn=unroll_fn,
+                scan_length=(num_val_episode * scenario_length) // unroll_length,
+            ),
+            axis_name="batch",
+        )
+
     rng, rb_key = jax.random.split(rng)
     buffer_state = jax.pmap(replay_buffer.init)(jax.random.split(rb_key, num_devices))
 
@@ -189,6 +236,26 @@ def train(
     total_iters = (remaining_timesteps // env_steps_per_iter) + (1 if remaining_timesteps > 0 else 0)
     if resumed_step:
         print(f"-> {resumed_step}/{total_timesteps} steps already done, {total_iters} iterations remaining")
+
+    # Fixed keys: the same held-out scenarios must be replayed identically at
+    # every validation, or the curve moves for reasons other than the params.
+    val_keys = jax.random.split(jax.random.PRNGKey(seed), num_devices)
+    best_val_loss = float("inf")
+    best_val_step = 0
+    n_stale_vals = 0
+    stopped_early = False
+
+    # Carried across resumes: starting a resumed run at best=inf would make its
+    # first validation "improve" unconditionally and overwrite model_best.pkl
+    # with a worse checkpoint, and would reset the patience counter.
+    val_state_path = f"{checkpoint_logdir}/val_state.json" if checkpoint_logdir else None
+    if resumed_step and val_state_path and os.path.exists(val_state_path):
+        with open(val_state_path) as fh:
+            val_state = json.load(fh)
+        best_val_loss = val_state["best_val_loss"]
+        best_val_step = val_state["best_val_step"]
+        n_stale_vals = val_state["n_stale_vals"]
+        print(f"-> Resuming validation state: best {best_val_loss:.6f} @ step {best_val_step}, {n_stale_vals} stale")
 
     print("-> Ground Control to Major Tom...")
     for iter in tqdm(
@@ -249,6 +316,67 @@ def train(
 
         epoch_eval_time = perf_counter() - t
 
+        # Validation loss + early stopping
+        if do_validation and not iter % val_freq:
+            t = perf_counter()
+            val_loss = float(jnp.mean(run_validation(val_scenario, training_state, val_keys)))
+            improved = val_loss < best_val_loss - early_stop_min_delta
+            if improved:
+                best_val_loss, best_val_step, n_stale_vals = val_loss, current_step, 0
+                if checkpoint_logdir:
+                    train_utils.save_params(
+                        f"{checkpoint_logdir}/model_best.pkl", pmap.unpmap(training_state.params)
+                    )
+            else:
+                n_stale_vals += 1
+
+            if val_state_path:
+                with open(val_state_path, "w") as fh:
+                    json.dump(
+                        {
+                            "best_val_loss": best_val_loss,
+                            "best_val_step": best_val_step,
+                            "n_stale_vals": n_stale_vals,
+                            "last_val_loss": val_loss,
+                            "last_val_step": current_step,
+                        },
+                        fh,
+                    )
+
+            # No total_timesteps here: that branch of log_metrics prints the
+            # per-iteration runtime keys, which this dict does not carry.
+            progress_fn(
+                current_step,
+                {
+                    "val/imitation_loss": val_loss,
+                    "val/best_imitation_loss": best_val_loss,
+                    "val/stale_validations": n_stale_vals,
+                    "val/val_time": perf_counter() - t,
+                },
+            )
+            print(
+                f"-> val/imitation_loss {val_loss:.6f} (best {best_val_loss:.6f} @ step "
+                f"{best_val_step}, {n_stale_vals} stale)",
+                flush=True,
+            )
+
+            if early_stop_patience and n_stale_vals >= early_stop_patience:
+                print(
+                    f"-> EARLY STOP at step {current_step}: no improvement > {early_stop_min_delta} "
+                    f"over {best_val_loss:.6f} in {n_stale_vals} validations. "
+                    f"Best params are in {checkpoint_logdir}/model_best.pkl (step {best_val_step}).",
+                    flush=True,
+                )
+                stopped_early = True
+                if early_stop_marker:
+                    with open(early_stop_marker, "w") as fh:
+                        fh.write(
+                            f"early stopped at env_steps={current_step} of total_timesteps={total_timesteps}\n"
+                            f"best val/imitation_loss={best_val_loss:.6f} at env_steps={best_val_step}\n"
+                            f"best params: model_best.pkl\n"
+                        )
+                break
+
         if not iter % log_freq:
             metrics["runtime/data_time"] = epoch_data_time
             metrics["runtime/training_time"] = epoch_training_time
@@ -269,7 +397,13 @@ def train(
                 )
 
     print(f"-> Training took {perf_counter() - time_training:.2f}s")
-    assert current_step >= total_timesteps
+    if stopped_early:
+        # Leave train_state_latest.pkl at the stopping point rather than the
+        # target: resuming this run would otherwise train right back past the
+        # point validation said to stop at.
+        print(f"-> Stopped early at {current_step}/{total_timesteps} steps")
+    else:
+        assert current_step >= total_timesteps
 
     if checkpoint_logdir:
         path = f"{checkpoint_logdir}/model_final.pkl"

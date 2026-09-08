@@ -75,6 +75,28 @@ def run(cfg: DictConfig) -> None:
     else:
         eval_scenario = None
 
+    # Held-out scenarios for BC's validation loss / early stopping. Drawn once
+    # and reused, with the same per-device batch shape as the training data, so
+    # the loss is directly comparable to train/imitation_loss.
+    val_scenario = None
+    if env_config["path_dataset_val"]:
+        num_val_episode = max(1, env_config["num_scenario_per_val"] // env_config["num_envs"])
+        val_data_generator = simulator.make_data_generator(
+            path=env_config["path_dataset_val"],
+            max_num_objects=env_config["max_num_objects"],
+            max_num_rg_points=env_config["max_num_rg_points"],
+            include_sdc_paths=env_config["sdc_paths_from_data"],
+            batch_dims=(env_config["num_envs"], num_val_episode),
+            seed=69,
+            distributed=True,
+        )
+        val_scenario = next(val_data_generator)
+        del val_data_generator
+        print(
+            f"-> Validation set: {env_config['num_envs'] * num_val_episode} scenarios from "
+            f"{env_config['path_dataset_val']}"
+        )
+
     env = simulator.make_env_for_training(
         max_num_objects=env_config["max_num_objects"],
         dynamics_model=dynamics.InvertibleBicycleModel(normalize_actions=True),
@@ -98,11 +120,16 @@ def run(cfg: DictConfig) -> None:
     ## TRAINING
     train_fn = learning.get_train_fn(config["algorithm"]["name"])
 
+    # Only BC takes a validation set (its loss has a supervised target); the RL
+    # trainers would reject the kwarg.
+    val_kwargs = {"val_scenario": val_scenario} if val_scenario is not None else {}
+
     train_fn(
         env=env,
         data_generator=data_generator,
         eval_scenario=eval_scenario,
         **run_config,
+        **val_kwargs,
         progress_fn=progress,
         checkpoint_logdir=model_path,
         disable_tqdm=not sys.stdout.isatty(),

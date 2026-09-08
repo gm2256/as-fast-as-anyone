@@ -206,6 +206,65 @@ def _reshape_metrics(rollout_metrics: dict, sgd_metrics: dict) -> dict:
     }
 
 
+def run_validation_loss(
+    batch_scenarios: waymax_datatypes.SimulatorState,
+    training_state: datatypes.TrainingState,
+    key: jax.Array,
+    env: waymax_env.PlanningAgentEnvironment,
+    loss_fn: typing.Callable,
+    unroll_fn: pipeline.generate_unroll,
+    scan_length: int,
+):
+    """Imitation loss of the current params on held-out scenarios, without updating them.
+
+    Mirrors the training data path exactly - the expert drives the environment
+    and every step yields an (observation, expert action) pair - so the number
+    is directly comparable to `train/imitation_loss`. The only differences are
+    that the scenarios are ones training never samples, and that no gradient is
+    taken. That makes the gap between the two curves the usual overfitting
+    signal, and the validation curve flattening the cue to stop (see
+    bc_trainer's early stopping).
+
+    Args:
+        batch_scenarios: Held-out scenarios (fixed across calls, so the number
+            is comparable from one validation to the next).
+        training_state: The current training state.
+        key: The random key.
+        env: The environment.
+        loss_fn: `bc.make_loss_fn(...)` - (policy_params, transitions) -> loss.
+        unroll_fn: The function to generate an unroll (expert-stepped).
+        scan_length: Number of unrolls to average over.
+
+    Returns:
+        The mean loss over the held-out scenarios.
+
+    """
+
+    def run_step(carry, _t):
+        env_state, _key = carry
+        _key, unroll_key = jax.random.split(_key)
+
+        # policy_fn is unused by expert_step; the expert drives, we only score.
+        next_state, _, data = unroll_fn(env_state, None, unroll_key)
+        loss = loss_fn(training_state.params.policy, data)
+
+        return (next_state, _key), loss
+
+    key, subkey = jax.random.split(key, 2)
+    reset_keys = jax.random.split(subkey, batch_scenarios.shape)
+
+    env_state = env.init_and_reset(batch_scenarios, reset_keys)
+
+    _, losses = jax.lax.scan(
+        run_step,
+        (env_state, key),
+        (),
+        length=scan_length,
+    )
+
+    return jnp.mean(losses)
+
+
 def run_evaluation(
     batch_scenarios: waymax_datatypes.SimulatorState,
     training_state: datatypes.TrainingState,
