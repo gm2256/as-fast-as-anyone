@@ -139,8 +139,33 @@ def train(
     elif pretrained_params_path:
         print(f"-> Loading pretrained params from {pretrained_params_path} ...")
         loaded_params = train_utils.load_params(pretrained_params_path)
-        loaded_params = pmap.device_put_replicated(loaded_params, jax.local_devices()[:num_devices])
-        training_state = training_state.replace(params=loaded_params)
+
+        if getattr(loaded_params, "value", None) is not None:
+            # Another SAC run's params: same struct, take it whole.
+            training_state = training_state.replace(
+                params=pmap.device_put_replicated(loaded_params, jax.local_devices()[:num_devices])
+            )
+        else:
+            # A policy-only checkpoint - a BC pre-training run. Its struct has no
+            # value/target_value, and its head emits the action (size 2) where
+            # SAC's emits distribution parameters (size 4), so the params cannot
+            # be swapped in wholesale; graft the arrays that do match instead.
+            source_policy = getattr(loaded_params, "policy", loaded_params)
+            params = pmap.unpmap(training_state.params)
+            policy, n_copied, n_kept = train_utils.graft_matching_params(params.policy, source_policy)
+            params = params.replace(policy=policy)
+            training_state = training_state.replace(
+                params=pmap.device_put_replicated(params, jax.local_devices()[:num_devices])
+            )
+            print(
+                f"-> Policy-only checkpoint: grafted {n_copied} arrays, kept {n_kept} at fresh init "
+                f"(the value networks and the distribution head always start fresh)."
+            )
+            if n_copied == 0:
+                print(
+                    "-> WARNING: nothing transferred. Match the pre-training network, e.g. "
+                    "'algorithm.network.policy.layer_sizes=[256,64,32] network/encoder=lq'."
+                )
         print("-> Loading pretrained params... Done.")
 
     learning_fn = sac.make_sgd_step(network, alpha, discount, tau)

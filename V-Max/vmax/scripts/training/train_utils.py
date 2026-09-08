@@ -7,6 +7,7 @@ import logging
 import os
 import pickle
 from argparse import ArgumentParser
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -211,6 +212,60 @@ def load_params(path: str) -> Any:
     """Load and deserialize model parameters from a specified file."""
     with epath.Path(path).open("rb") as fin:
         return pickle.loads(fin.read())
+
+
+def graft_matching_params(target: Any, source: Any) -> tuple[Any, int, int]:
+    """Copy every array from `source` into `target` where the path and shape match.
+
+    For warm-starting one algorithm's policy from another's, where the two
+    networks agree on most of their weights but not all of them. A BC policy
+    into SAC is the case this exists for: the observation encoder and the hidden
+    layers are identical if configured the same, but BC's head emits the action
+    (size 2) while SAC's emits the parameters of a distribution over it (size
+    4), so that one layer cannot transfer and must stay at its fresh init.
+
+    Anything the source does not have, or has at a different shape, keeps
+    `target`'s value - so a mismatch degrades the warm start instead of
+    breaking the run. Check the returned counts to see how much actually
+    transferred: if it is close to zero, the network configs do not line up
+    (e.g. algorithm.network.policy.layer_sizes differ) and the warm start is
+    doing nothing.
+
+    Args:
+        target: Freshly initialized parameter tree (defines the shapes).
+        source: Parameter tree to copy from.
+
+    Returns:
+        (grafted tree, number of arrays copied, number of arrays kept).
+
+    """
+    n_copied = n_kept = 0
+
+    def count_leaves(tree) -> int:
+        if isinstance(tree, Mapping):
+            return sum(count_leaves(v) for v in tree.values())
+        return 1
+
+    def graft(t, s):
+        nonlocal n_copied, n_kept
+        if isinstance(t, Mapping):
+            if not isinstance(s, Mapping):
+                n_kept += count_leaves(t)
+                return t
+            out = {k: graft(v, s[k]) if k in s else _keep(v) for k, v in t.items()}
+            return type(t)(out) if not isinstance(t, dict) else out
+        if getattr(t, "shape", None) is not None and getattr(t, "shape", None) == getattr(s, "shape", None):
+            n_copied += 1
+            return s
+        n_kept += 1
+        return t
+
+    def _keep(v):
+        nonlocal n_kept
+        n_kept += count_leaves(v)
+        return v
+
+    return graft(target, source), n_copied, n_kept
 
 
 def setup_tensorboard(run_path: str) -> SummaryWriter:
