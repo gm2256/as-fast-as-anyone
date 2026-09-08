@@ -25,6 +25,10 @@ early_stop_min_delta: 0.0  # improvement smaller than this does not reset the pa
 # Stopping is disabled until this many env steps to keep that transient from
 # ending the run at an untrained network.
 early_stop_warmup_steps: 1_000_000
+# The validation loss bounces ~25% between consecutive validations (the params
+# themselves oscillate at this batch size), so patience on the raw value fires
+# on noise. Decisions use an EMA of it instead; 0 disables the smoothing.
+early_stop_smoothing: 0.7
 
 network:
   policy:

@@ -212,6 +212,7 @@ def run_validation_loss(
     key: jax.Array,
     env: waymax_env.PlanningAgentEnvironment,
     loss_fn: typing.Callable,
+    baseline_fn: typing.Callable,
     unroll_fn: pipeline.generate_unroll,
     scan_length: int,
 ):
@@ -232,11 +233,14 @@ def run_validation_loss(
         key: The random key.
         env: The environment.
         loss_fn: `bc.make_loss_fn(...)` - (policy_params, transitions) -> loss.
+        baseline_fn: `bc.make_zero_baseline_fn(...)` - the same loss for a
+            policy that always outputs zero, so the caller can report the ratio
+            (the raw loss is small even untrained, see that function).
         unroll_fn: The function to generate an unroll (expert-stepped).
         scan_length: Number of unrolls to average over.
 
     Returns:
-        The mean loss over the held-out scenarios.
+        (mean loss, mean zero-output baseline loss) over the held-out scenarios.
 
     """
 
@@ -254,21 +258,21 @@ def run_validation_loss(
         data = jax.tree.map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data)
         loss = loss_fn(training_state.params.policy, data)
 
-        return (next_state, _key), loss
+        return (next_state, _key), (loss, baseline_fn(data))
 
     key, subkey = jax.random.split(key, 2)
     reset_keys = jax.random.split(subkey, batch_scenarios.shape)
 
     env_state = env.init_and_reset(batch_scenarios, reset_keys)
 
-    _, losses = jax.lax.scan(
+    _, (losses, baselines) = jax.lax.scan(
         run_step,
         (env_state, key),
         (),
         length=scan_length,
     )
 
-    return jnp.mean(losses)
+    return jnp.mean(losses), jnp.mean(baselines)
 
 
 def run_evaluation(

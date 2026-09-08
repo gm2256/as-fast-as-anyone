@@ -57,6 +57,7 @@ def train(
     early_stop_patience: int = 0,
     early_stop_min_delta: float = 0.0,
     early_stop_warmup_steps: int = 0,
+    early_stop_smoothing: float = 0.0,
 ) -> None:
     """Train a Behavioral Cloning (BC) model.
 
@@ -228,6 +229,7 @@ def train(
                 pipeline.run_validation_loss,
                 env=env,
                 loss_fn=bc.make_loss_fn(network, loss_type),
+                baseline_fn=bc.make_zero_baseline_fn(loss_type),
                 unroll_fn=unroll_fn,
                 scan_length=(num_val_episode * scenario_length) // unroll_length,
             ),
@@ -251,6 +253,7 @@ def train(
     best_val_loss = float("inf")
     best_val_step = 0
     n_stale_vals = 0
+    val_ema = None
     stopped_early = False
 
     # Carried across resumes: starting a resumed run at best=inf would make its
@@ -263,6 +266,7 @@ def train(
         best_val_loss = val_state["best_val_loss"]
         best_val_step = val_state["best_val_step"]
         n_stale_vals = val_state["n_stale_vals"]
+        val_ema = val_state.get("val_ema")
         print(f"-> Resuming validation state: best {best_val_loss:.6f} @ step {best_val_step}, {n_stale_vals} stale")
 
     print("-> Ground Control to Major Tom...")
@@ -330,14 +334,23 @@ def train(
         # Validation loss + early stopping
         if do_validation and not iter % val_freq:
             t = perf_counter()
-            val_loss = float(jnp.mean(run_validation(val_scenario, training_state, val_keys)))
+            val_loss, val_baseline = run_validation(val_scenario, training_state, val_keys)
+            val_loss, val_baseline = float(jnp.mean(val_loss)), float(jnp.mean(val_baseline))
+
+            val_ema = (
+                val_loss
+                if val_ema is None
+                else early_stop_smoothing * val_ema + (1 - early_stop_smoothing) * val_loss
+            )
+            # What patience actually judges: smoothed unless smoothing is off.
+            val_score = val_ema if early_stop_smoothing else val_loss
 
             in_warmup = current_step < early_stop_warmup_steps
-            improved = (not in_warmup) and val_loss < best_val_loss - early_stop_min_delta
+            improved = (not in_warmup) and val_score < best_val_loss - early_stop_min_delta
             if in_warmup:
                 pass  # logged below; no best, no patience - see early_stop_warmup_steps
             elif improved:
-                best_val_loss, best_val_step, n_stale_vals = val_loss, current_step, 0
+                best_val_loss, best_val_step, n_stale_vals = val_score, current_step, 0
                 if checkpoint_logdir:
                     train_utils.save_params(
                         f"{checkpoint_logdir}/model_best.pkl", pmap.unpmap(training_state.params)
@@ -352,6 +365,7 @@ def train(
                             "best_val_loss": best_val_loss,
                             "best_val_step": best_val_step,
                             "n_stale_vals": n_stale_vals,
+                            "val_ema": val_ema,
                             "last_val_loss": val_loss,
                             "last_val_step": current_step,
                         },
@@ -360,17 +374,26 @@ def train(
 
             # No total_timesteps here: that branch of log_metrics prints the
             # per-iteration runtime keys, which this dict does not carry.
-            val_metrics = {"val/imitation_loss": val_loss, "val/val_time": perf_counter() - t}
+            val_metrics = {
+                "val/imitation_loss": val_loss,
+                # 1.0 = no better than always outputting zero; lower is better.
+                "val/loss_vs_zero_policy": val_loss / max(val_baseline, 1e-12),
+                "val/zero_policy_loss": val_baseline,
+                "val/imitation_loss_smoothed": val_ema,
+                "val/val_time": perf_counter() - t,
+            }
             if not in_warmup:  # best is still +inf during warmup - not a plottable value
                 val_metrics["val/best_imitation_loss"] = best_val_loss
                 val_metrics["val/stale_validations"] = n_stale_vals
             progress_fn(current_step, val_metrics)
             print(
-                f"-> val/imitation_loss {val_loss:.6f} "
+                f"-> val/imitation_loss {val_loss:.6f} ({val_loss / max(val_baseline, 1e-12):.3f} of the "
+                f"zero-output baseline {val_baseline:.6f}) "
                 + (
                     f"(warmup, no early stop before {early_stop_warmup_steps} steps)"
                     if in_warmup
-                    else f"(best {best_val_loss:.6f} @ step {best_val_step}, {n_stale_vals} stale)"
+                    else f"(smoothed {val_score:.6f}, best {best_val_loss:.6f} @ step "
+                    f"{best_val_step}, {n_stale_vals} stale)"
                 ),
                 flush=True,
             )

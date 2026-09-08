@@ -182,6 +182,26 @@ def make_sgd_step(bc_network: BCNetwork, loss_type: str) -> datatypes.LearningFu
     return sgd_step
 
 
+def make_zero_baseline_fn(loss_type: str):
+    """Loss of a policy that always outputs zero - the floor the model must beat.
+
+    Expert actions are overwhelmingly near zero (steady speed, straight lane
+    keeping), and a tanh-output network starts there, so the raw imitation loss
+    is small from the very first step and says little on its own. Dividing by
+    this baseline turns it into "how much of the expert's actual variation did
+    we capture": 1.0 means nothing was learned, 0 means perfect.
+    """
+
+    def compute_zero_baseline(transitions: datatypes.RLTransition) -> jax.Array:
+        if loss_type == "mse":
+            return jnp.mean(transitions.action**2)
+        elif loss_type == "mae":
+            return jnp.mean(jnp.abs(transitions.action))
+        raise ValueError(f"Loss type {loss_type} not supported.")
+
+    return compute_zero_baseline
+
+
 def make_loss_fn(bc_network: BCNetwork, loss_type: str):
     """Generate the loss function for BC training (also used for validation).
 
